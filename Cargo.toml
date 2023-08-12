@@ -8,10 +8,12 @@ edition = "2021"
 [lib]
 crate-type = ["cdylib"]
 
+[profile.dev]
+panic = 'abort'
+
 [dependencies]
 c_string = "0.7.2"
 
 [build-dependencies]
 bindgen = "0.66.1"
-
 
