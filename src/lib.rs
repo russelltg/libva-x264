@@ -25,7 +25,7 @@ use c_string::c_str;
 use memfd::{FileSeal, Memfd, MemfdOptions};
 use nix::{
     ioctl_read, ioctl_write_ptr,
-    libc::{ftruncate, PROT_READ, PROT_WRITE},
+    libc::{ftruncate, MAP_SHARED, PROT_READ, PROT_WRITE},
     sys::mman::{mmap, munmap, MapFlags, ProtFlags},
 };
 use sys::*;
@@ -49,7 +49,7 @@ struct Config {
 #[derive(Debug)]
 enum Buffer {
     Surface {
-        dmabuf_fd: OwnedFd,
+        buf: UDmabufAllocation,
         size: usize,
         map: Option<NonNull<c_void>>,
     },
@@ -304,7 +304,7 @@ unsafe extern "C" fn map_buffer(
 ) -> VAStatus {
     let driver = &mut *((*ctx).pDriverData as *mut Driver);
 
-    match driver.map_buffer(buf_id) {
+    match Driver::map_buffer(&mut driver.buffers, buf_id) {
         Ok(ptr) => {
             pbuf.write(ptr);
             VA_STATUS_SUCCESS
@@ -554,6 +554,12 @@ struct UDmaBuf {
     fd: OwnedFd,
 }
 
+#[derive(Debug)]
+struct UDmabufAllocation {
+    dmabuf: OwnedFd,
+    memfd: Memfd,
+}
+
 impl UDmaBuf {
     fn new() -> Self {
         Self {
@@ -561,7 +567,7 @@ impl UDmaBuf {
         }
     }
 
-    fn alloc_dmabuf(&mut self, size: usize) -> OwnedFd {
+    fn alloc_dmabuf(&mut self, size: usize) -> UDmabufAllocation {
         unsafe {
             let memfd = MemfdOptions::default()
                 .allow_sealing(true)
@@ -577,14 +583,18 @@ impl UDmaBuf {
             let dmabuf_fd = udmabuf_create(
                 self.fd.as_raw_fd(),
                 &udmabuf_create {
-                    memfd: memfd.into_raw_fd() as u32,
+                    memfd: memfd.as_raw_fd() as u32,
                     flags: UDMABUF_FLAGS_CLOEXEC as u32,
                     offset: 0,
                     size: size_aligned as u64,
                 },
             )
             .unwrap();
-            OwnedFd::from_raw_fd(dmabuf_fd)
+
+            UDmabufAllocation {
+                dmabuf: OwnedFd::from_raw_fd(dmabuf_fd),
+                memfd,
+            }
         }
     }
 }
@@ -820,12 +830,12 @@ impl Driver {
                             let stride = align_up(width as usize * 4, 512);
                             let size = stride as i64 * height as i64;
 
-                            let dmabuf_fd = self.udma.alloc_dmabuf(size as usize);
+                            let buf = self.udma.alloc_dmabuf(size as usize);
 
                             let buffer_id = self.buffers.len() as u32;
                             self.buffers.push(Some(Buffer::Surface {
                                 // memfd,
-                                dmabuf_fd,
+                                buf,
                                 size: size as usize,
                                 map: None,
                             }));
@@ -847,12 +857,12 @@ impl Driver {
                             let stride = align_up(width as usize, 2048);
                             let size = stride as i64 * (height + (height + 1) / 2) as i64;
 
-                            let dmabuf_fd = self.udma.alloc_dmabuf(size as usize);
+                            let buf = self.udma.alloc_dmabuf(size as usize);
 
                             let buffer_id = self.buffers.len() as u32;
                             self.buffers.push(Some(Buffer::Surface {
                                 // memfd,
-                                dmabuf_fd,
+                                buf,
                                 size: size as usize,
                                 map: None,
                             }));
@@ -999,9 +1009,7 @@ impl Driver {
         // let buffer = &self.buffer(surface.buffer_id)?.buffer;
         let buffer = self.buffer(surface.buffer_id)?;
         let (dmabuf_fd, size) = match buffer {
-            Buffer::Surface {
-                dmabuf_fd, size, ..
-            } => (dmabuf_fd, size),
+            Buffer::Surface { buf, size, .. } => (buf, size),
             _ => return Err(VA_STATUS_ERROR_INVALID_SURFACE),
         };
 
@@ -1103,11 +1111,9 @@ impl Driver {
                 .ok_or(VA_STATUS_ERROR_INVALID_BUFFER)?;
 
             match buffer {
-                Buffer::Surface {
-                    dmabuf_fd, size, ..
-                } => {
+                Buffer::Surface { buf, size, .. } => {
                     Ok(VABufferInfo {
-                        handle: dmabuf_fd.as_raw_fd() as usize,
+                        handle: buf.dmabuf.as_raw_fd() as usize,
                         type_: 0, // ???
                         mem_type,
                         mem_size: *size,
@@ -1130,10 +1136,8 @@ impl Driver {
         let surf = self.surface(surface_id)?;
         let buffer = self.buffer(surf.buffer_id)?;
 
-        let (dmabuf_fd, size) = match buffer {
-            Buffer::Surface {
-                dmabuf_fd, size, ..
-            } => (dmabuf_fd, size),
+        let (buf, size) = match buffer {
+            Buffer::Surface { buf, size, .. } => (buf, size),
             _ => return Err(VA_STATUS_ERROR_INVALID_SURFACE),
         };
 
@@ -1152,7 +1156,7 @@ impl Driver {
             num_objects: 1,
             objects: [
                 _VADRMPRIMESurfaceDescriptor__bindgen_ty_1 {
-                    fd: dmabuf_fd.as_raw_fd(),
+                    fd: buf.dmabuf.as_raw_fd(),
                     size: *size as u32,
                     drm_format_modifier: 0, // ??
                 },
@@ -1232,28 +1236,24 @@ impl Driver {
         Ok(id as u32)
     }
 
-    fn map_buffer(&mut self, buf_id: u32) -> Result<*mut c_void, VAStatus> {
-        let buf = self.buffer_mut(buf_id)?;
+    fn map_buffer(buffers: &mut Vec<Option<Buffer>>, buf_id: u32) -> Result<*mut c_void, VAStatus> {
+        let buf = Driver::get_field_mut(buffers, buf_id)?;
 
         match buf {
             Buffer::CodedBufferSegment(cs) => Ok(cs as *mut _ as _),
             Buffer::Surface {
-                dmabuf_fd,
+                buf,
                 size,
                 map: Some(map),
             } => Ok(map.as_ptr()),
-            Buffer::Surface {
-                dmabuf_fd,
-                size,
-                map,
-            } => {
+            Buffer::Surface { buf, size, map } => {
                 let ptr = unsafe {
                     mmap(
                         None,
                         NonZeroUsize::new(*size).unwrap(),
                         ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-                        MapFlags::empty(),
-                        dmabuf_fd.as_raw_fd(),
+                        MapFlags::MAP_SHARED,
+                        buf.memfd.as_raw_fd(),
                         0,
                     )
                 }
@@ -1269,9 +1269,9 @@ impl Driver {
         match self.buffer_mut(buf_id)? {
             Buffer::CodedBufferSegment(_) => {}
             Buffer::Surface {
-                dmabuf_fd,
                 size,
                 map: m @ Some(_),
+                ..
             } => {
                 unsafe { munmap(m.unwrap().as_mut(), *size) }.unwrap();
                 *m = None;
@@ -1287,17 +1287,22 @@ impl Driver {
         context: VAContextID,
         buffers: &[VABufferID],
     ) -> Result<(), VAStatus> {
-        let context = self.context(context)?;
-        let config = self.config(context.config_id)?;
+        let context = Driver::get_field(&self.contexts, context)?;
+        let config = Driver::get_field(&self.configs, context.config_id)?;
 
-        let target = self.surface(
+        let target = Driver::get_field(
+            &self.surfaces,
             context
                 .render_target
                 .ok_or(VA_STATUS_ERROR_INVALID_SURFACE)?,
         )?;
 
         for buf in buffers {
-            match (self.buffer(*buf)?, config.profile, config.entrypoint) {
+            match (
+                Driver::get_field(&self.buffers, *buf)?,
+                config.profile,
+                config.entrypoint,
+            ) {
                 (Buffer::Surface { .. }, _, _) => todo!(),
                 (
                     Buffer::VppPipelineParameterBufferType(pic),
@@ -1310,14 +1315,16 @@ impl Driver {
                     assert!(pic.blend_state.is_null());
                     assert!(pic.additional_outputs.is_null());
 
-                    let input_surface = self.surface(pic.surface)?;
+                    let input_surface = Driver::get_field(&self.surfaces, pic.surface)?;
 
                     let surface_region = unsafe { &*pic.surface_region };
                     assert_eq!(target.width, surface_region.width as u32);
                     assert_eq!(target.height, surface_region.height as u32);
 
-                    // let input_map = self.map_buffer(input_surface.buffer_id)? as *mut u8;
-                    // let output_map = self.map_buffer(target.buffer_id)? as *mut u8;
+                    let input_map =
+                        Driver::map_buffer(&mut self.buffers, input_surface.buffer_id)? as *mut u8;
+                    let output_map =
+                        Driver::map_buffer(&mut self.buffers, target.buffer_id)? as *mut u8;
 
                     // for i in 0..surface_region.height {
                     //     output_map.offset()
@@ -1327,16 +1334,44 @@ impl Driver {
                     // self.unmap_buffer(target.buffer_id);
                 }
                 (Buffer::CodedBufferSegment(_), _, _) => todo!(),
-                (Buffer::Generic { mem_type: VABufferType_VAEncSequenceParameterBufferType, data }, VAProfile_VAProfileH264Main, VAEntrypoint_VAEntrypointFEI | VAEntrypoint_VAEntrypointEncPicture) => {
+                (
+                    Buffer::Generic {
+                        mem_type: VABufferType_VAEncSequenceParameterBufferType,
+                        data,
+                    },
+                    VAProfile_VAProfileH264Main,
+                    VAEntrypoint_VAEntrypointFEI | VAEntrypoint_VAEntrypointEncPicture,
+                ) => {
                     println!("discarding SequenceParamter for now...")
                 }
-                (Buffer::Generic { mem_type: VABufferType_VAEncMiscParameterBufferType, data }, VAProfile_VAProfileH264Main, VAEntrypoint_VAEntrypointEncPicture) => {
+                (
+                    Buffer::Generic {
+                        mem_type: VABufferType_VAEncMiscParameterBufferType,
+                        data,
+                    },
+                    VAProfile_VAProfileH264Main,
+                    VAEntrypoint_VAEntrypointEncPicture,
+                ) => {
                     println!("discarding MiscParameter for now...")
                 }
-                (Buffer::Generic { mem_type: VABufferType_VAEncPictureParameterBufferType, data }, VAProfile_VAProfileH264Main, VAEntrypoint_VAEntrypointEncPicture) => {
+                (
+                    Buffer::Generic {
+                        mem_type: VABufferType_VAEncPictureParameterBufferType,
+                        data,
+                    },
+                    VAProfile_VAProfileH264Main,
+                    VAEntrypoint_VAEntrypointEncPicture,
+                ) => {
                     println!("discarding PictureParameter for now...")
                 }
-                (Buffer::Generic { mem_type: VABufferType_VAEncSliceParameterBufferType, data }, VAProfile_VAProfileH264Main, VAEntrypoint_VAEntrypointEncPicture) => {
+                (
+                    Buffer::Generic {
+                        mem_type: VABufferType_VAEncSliceParameterBufferType,
+                        data,
+                    },
+                    VAProfile_VAProfileH264Main,
+                    VAEntrypoint_VAEntrypointEncPicture,
+                ) => {
                     println!("discarding EncSliceParameter for now...")
                 }
 
@@ -1394,6 +1429,12 @@ impl Driver {
         vec.get(id as usize)
             .ok_or(VA_STATUS_ERROR_INVALID_BUFFER)?
             .as_ref()
+            .ok_or(VA_STATUS_ERROR_INVALID_BUFFER)
+    }
+    fn get_field_mut<T>(vec: &mut Vec<Option<T>>, id: u32) -> Result<&mut T, VAStatus> {
+        vec.get_mut(id as usize)
+            .ok_or(VA_STATUS_ERROR_INVALID_BUFFER)?
+            .as_mut()
             .ok_or(VA_STATUS_ERROR_INVALID_BUFFER)
     }
 
