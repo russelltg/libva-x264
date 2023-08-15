@@ -2,10 +2,29 @@ mod sys;
 
 use ::std::os::raw::{c_int, c_uint};
 use core::slice;
-use std::ffi::c_void;
+use std::{
+    ffi::{c_void, CStr},
+    mem,
+    os::fd::{BorrowedFd, OwnedFd, AsFd, AsRawFd, FromRawFd},
+    ptr::{null, null_mut}, fs::File,
+};
 
 use c_string::c_str;
+use gbm::{BufferObject, BufferObjectFlags, Device};
+use gles30::{GlFns, GL_RGB, GL_TEXTURE_2D, GL_UNSIGNED_BYTE};
+use khronos_egl::{
+    Boolean, Display, Dynamic, DynamicInstance, EGLDisplay, EGLImage, Instance, Int,
+    NativeDisplayType, Upcast, ALPHA_SIZE, ATTRIB_NONE, BLUE_SIZE, COLOR_BUFFER_TYPE,
+    CONTEXT_CLIENT_TYPE, CONTEXT_CLIENT_VERSION, CONTEXT_MAJOR_VERSION, CONTEXT_MINOR_VERSION,
+    CONTEXT_OPENGL_FORWARD_COMPATIBLE, DEFAULT_DISPLAY, EGL1_1, EGL1_5, GREEN_SIZE, HEIGHT, NONE,
+    OPENGL_API, OPENGL_ES2_BIT, OPENGL_ES_API, PBUFFER_BIT, RED_SIZE, RENDERABLE_TYPE, RGB_BUFFER,
+    SURFACE_TYPE, TRUE, WIDTH,
+};
+use memfd::{MemfdOptions, FileSeal};
+use nix::{ioctl_read, ioctl_write_ptr, libc::ftruncate};
 use sys::*;
+
+const EGL_YUV_BUFFER_EXT: Int = 0x3300;
 
 const NUM_PROFILES: usize = 1;
 const NUM_ENTRYPOINTS: usize = 1;
@@ -18,48 +37,22 @@ const NUM_DISPLAY_ATTRIBUTES: usize = 1;
 struct Config {}
 
 #[derive(Debug)]
+struct Buffer {
+    // gl_handle: u32,
+    // egl_image: Image,
+    dmabuf_fd: OwnedFd,
+    size: usize,
+
+    // buffer: BufferObject<()>,
+}
+
+#[derive(Debug)]
 struct Surface {
     width: u32,
     height: u32,
-    pitch: Vec<u32>,
     format: VAImageFormat,
-    data: Vec<Vec<u8>>,
-}
-impl Surface {
-    fn new_rgb32(width: u32, height: u32) -> Surface {
-        Surface {
-            width,
-            height,
-            pitch: vec![width * 3],
-            format: Driver::IMAGE_FMT_RGB32,
-            data: vec![{
-                let mut v = Vec::new();
-                v.resize(width as usize * height as usize * 3, 0);
-                v
-            }],
-        }
-    }
-
-    fn new_nv12(width: u32, height: u32) -> Surface {
-        Surface {
-            width,
-            height,
-            pitch: vec![width, width],
-            format: Driver::IMAGE_FMT_NV12,
-            data: vec![
-                {
-                    let mut v = Vec::new();
-                    v.resize(width as usize * height as usize, 0);
-                    v
-                },
-                {
-                    let mut v = Vec::new();
-                    v.resize(width as usize * (height as usize + 1) / 2, 0);
-                    v
-                },
-            ],
-        }
-    }
+    buffer_id: u32,
+    planes: Vec<(u32, u32)>, // (pitch, offset)
 }
 
 #[derive(Debug)]
@@ -68,21 +61,32 @@ struct Context {}
 #[derive(Debug)]
 struct Image {}
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Driver {
+    // egl: DynamicInstance<EGL1_5>,
+    // gles: GlFns,
+    // egl_display: Display,
+    // gbm: Device<OwnedFd>,
     surfaces: Vec<Option<Surface>>,
     configs: Vec<Config>,
     contexts: Vec<Option<Context>>,
     images: Vec<Option<Image>>,
+    buffers: Vec<Option<Buffer>>,
+    // egl_ctx: khronos_egl::Context,
+    // egl_export_dmabuf_image_mesa: unsafe extern "C" fn(display: EGLDisplay,
+    //                                     image: EGLImage,
+    //                                     fds: *mut c_int,
+    // 			        strides: *mut c_int,
+    // 				offset: *mut c_int) -> Boolean,
 }
 
-pub unsafe extern "C" fn terminate(ctx: VADriverContextP) -> VAStatus {
+unsafe extern "C" fn terminate(ctx: VADriverContextP) -> VAStatus {
     drop(Box::from_raw((*ctx).pDriverData as *mut Driver));
 
     VA_STATUS_SUCCESS as VAStatus
 }
 
-pub unsafe extern "C" fn query_config_profiles(
+unsafe extern "C" fn query_config_profiles(
     ctx: VADriverContextP,
     profile_list: *mut VAProfile,
     num_profiles: *mut c_int,
@@ -97,7 +101,7 @@ pub unsafe extern "C" fn query_config_profiles(
     VA_STATUS_SUCCESS as VAStatus
 }
 
-pub unsafe extern "C" fn query_config_entrypoints(
+unsafe extern "C" fn query_config_entrypoints(
     ctx: VADriverContextP,
     profile: VAProfile,
     entrypoint_list: *mut VAEntrypoint,
@@ -116,7 +120,7 @@ pub unsafe extern "C" fn query_config_entrypoints(
     VA_STATUS_SUCCESS as VAStatus
 }
 
-pub unsafe extern "C" fn query_config_attributes(
+unsafe extern "C" fn query_config_attributes(
     ctx: VADriverContextP,
     config_id: VAConfigID,
     profile: *mut VAProfile,
@@ -127,7 +131,7 @@ pub unsafe extern "C" fn query_config_attributes(
     todo!()
 }
 
-pub unsafe extern "C" fn create_config(
+unsafe extern "C" fn create_config(
     ctx: VADriverContextP,
     profile: VAProfile,
     entrypoint: VAEntrypoint,
@@ -150,11 +154,11 @@ pub unsafe extern "C" fn create_config(
     }
 }
 
-pub unsafe extern "C" fn destroy_config(ctx: VADriverContextP, config_id: VAConfigID) -> VAStatus {
+unsafe extern "C" fn destroy_config(ctx: VADriverContextP, config_id: VAConfigID) -> VAStatus {
     todo!()
 }
 
-pub unsafe extern "C" fn get_config_attributes(
+unsafe extern "C" fn get_config_attributes(
     ctx: VADriverContextP,
     profile: VAProfile,
     entrypoint: VAEntrypoint,
@@ -171,7 +175,7 @@ pub unsafe extern "C" fn get_config_attributes(
     VA_STATUS_SUCCESS as VAStatus
 }
 
-pub unsafe extern "C" fn create_surfaces(
+unsafe extern "C" fn create_surfaces(
     ctx: VADriverContextP,
     width: c_int,
     height: c_int,
@@ -182,7 +186,7 @@ pub unsafe extern "C" fn create_surfaces(
     todo!()
 }
 
-pub unsafe extern "C" fn destroy_surfaces(
+unsafe extern "C" fn destroy_surfaces(
     ctx: VADriverContextP,
     surface_list: *mut VASurfaceID,
     num_surfaces: c_int,
@@ -195,7 +199,7 @@ pub unsafe extern "C" fn destroy_surfaces(
     }
 }
 
-pub unsafe extern "C" fn create_context(
+unsafe extern "C" fn create_context(
     ctx: VADriverContextP,
     config_id: VAConfigID,
     picture_width: c_int,
@@ -222,7 +226,7 @@ pub unsafe extern "C" fn create_context(
     }
 }
 
-pub unsafe extern "C" fn destroy_context(ctx: VADriverContextP, context: VAContextID) -> VAStatus {
+unsafe extern "C" fn destroy_context(ctx: VADriverContextP, context: VAContextID) -> VAStatus {
     let driver = &mut *((*ctx).pDriverData as *mut Driver);
 
     match driver.contexts.get_mut(context as usize) {
@@ -247,7 +251,7 @@ unsafe extern "C" fn query_image_formats(
     VA_STATUS_SUCCESS as VAStatus
 }
 
-pub unsafe extern "C" fn derive_image(
+unsafe extern "C" fn derive_image(
     ctx: VADriverContextP,
     surface: VASurfaceID,
     image: *mut VAImage,
@@ -275,7 +279,7 @@ unsafe extern "C" fn destroy_image(ctx: VADriverContextP, image: VAImageID) -> V
     }
 }
 
-pub unsafe extern "C" fn create_surfaces2(
+unsafe extern "C" fn create_surfaces2(
     ctx: VADriverContextP,
     format: c_uint,
     width: c_uint,
@@ -298,7 +302,7 @@ pub unsafe extern "C" fn create_surfaces2(
     VA_STATUS_SUCCESS as VAStatus
 }
 
-pub unsafe extern "C" fn query_surface_attributes(
+unsafe extern "C" fn query_surface_attributes(
     dpy: VADriverContextP,
     config: VAConfigID,
     attrib_list: *mut VASurfaceAttrib,
@@ -334,13 +338,92 @@ unsafe extern "C" fn acquire_buffer_handle(
     }
 }
 
-pub unsafe extern "C" fn unimpl() -> VAStatus {
+unsafe extern "C" fn unimpl() -> VAStatus {
     todo!()
 }
 
+ioctl_write_ptr!(udmabuf_create, b'k', 0x42, udmabuf_create);
+
 impl Driver {
     unsafe fn init_context(ctx: &mut VADriverContext) {
-        ctx.pDriverData = Box::into_raw(Box::new(Driver::default())) as *mut c_void;
+        let udma: OwnedFd = File::open("/dev/udmabuf").unwrap().into();
+
+
+
+        // let drm_fd = BorrowedFd::borrow_raw(*(ctx.drm_state as *const c_int))
+        //     .try_clone_to_owned()
+        //     .unwrap(); // this seems to always be the case. not sure if this is documented at all
+        // let gbm = Device::new(drm_fd).unwrap();
+
+        // let egl = DynamicInstance::<EGL1_5>::load_required().unwrap();
+
+        // let egl_export_dmabuf_image_mesa = mem::transmute(egl.get_proc_address("eglExportDMABUFImageMESA").unwrap());
+
+        // const PLATFORM_SURFACELES_MESA: u32 = 0x31DD;
+        // let egl_display = egl
+        //     .get_platform_display(PLATFORM_SURFACELES_MESA, DEFAULT_DISPLAY, &[ATTRIB_NONE])
+        //     .unwrap();
+        // egl.initialize(egl_display).unwrap();
+        // egl.bind_api(OPENGL_ES_API).unwrap();
+
+        // // let display = egl.get_display( wayland_conn.display().).unwrap();
+        // // let display = egl.get_current_display().unwrap();
+
+        // let mut configs = Vec::new();
+        // configs.reserve(1);
+        // egl.choose_config(
+        //     egl_display,
+        //     &[
+        //         SURFACE_TYPE,
+        //         PBUFFER_BIT,
+        //         RENDERABLE_TYPE,
+        //         OPENGL_ES2_BIT,
+        //         RED_SIZE,
+        //         1,
+        //         GREEN_SIZE,
+        //         1,
+        //         BLUE_SIZE,
+        //         1,
+        //         ALPHA_SIZE,
+        //         0,
+        //         NONE,
+        //     ],
+        //     &mut configs,
+        // )
+        // .unwrap();
+
+        // let egl_ctx = egl
+        //     .create_context(
+        //         egl_display,
+        //         configs[0],
+        //         None,
+        //         &[CONTEXT_CLIENT_VERSION, 3, NONE],
+        //     )
+        //     .unwrap();
+
+        // egl.make_current(egl_display, None, None, Some(egl_ctx))
+        //     .unwrap();
+
+        // let gles = GlFns::load_with(|c_char_ptr| {
+        //     match egl.get_proc_address(CStr::from_ptr(c_char_ptr).to_str().unwrap()) {
+        //         Some(ptr) => ptr as _,
+        //         None => null_mut(),
+        //     }
+        // });
+
+        ctx.pDriverData = Box::into_raw(Box::new(Driver {
+            // egl,
+            // gles,
+            // egl_display,
+            // egl_ctx,
+            // gbm,
+            surfaces: Default::default(),
+            configs: Default::default(),
+            contexts: Default::default(),
+            images: Default::default(),
+            buffers: Default::default(),
+            // egl_export_dmabuf_image_mesa,
+        })) as *mut c_void;
 
         ctx.version_major = VA_MAJOR_VERSION as i32;
         ctx.version_minor = VA_MINOR_VERSION as i32;
@@ -472,15 +555,165 @@ impl Driver {
         surfaces: &mut [u32],
         attribs: &[VASurfaceAttrib],
     ) {
-        // todo: attribs??
         for s in surfaces {
             *s = self.surfaces.len() as u32;
             match format {
-                VA_RT_FORMAT_RGB32 => self.surfaces.push(Some(Surface::new_rgb32(width, height))),
-                VA_RT_FORMAT_YUV420 => self.surfaces.push(Some(Surface::new_nv12(width, height))),
+                VA_RT_FORMAT_RGB32 => {
+
+                    let udma: OwnedFd = File::open("/dev/udmabuf").unwrap().into();
+                    
+                    let stride = width as usize * 3;
+                    let size = stride as i64 * height as i64;
+                    
+                    let memfd = MemfdOptions::default().allow_sealing(true).create("memfd").unwrap();
+                    
+                    let dmabuf_fd = unsafe { 
+                        ftruncate(memfd.as_raw_fd(), size);
+                        memfd.add_seal(FileSeal::SealShrink);
+                         OwnedFd::from_raw_fd(udmabuf_create(udma.as_raw_fd(), &udmabuf_create {
+                        memfd: memfd.as_raw_fd() as u32,
+                        flags: UDMABUF_FLAGS_CLOEXEC,
+                        offset: 0,
+                        size: size as u64,
+                    }).unwrap()) };
+
+                    let buffer_id = self.buffers.len() as u32;
+                    self.buffers.push(Some(Buffer { dmabuf_fd, size: size as usize }));
+
+                    self.surfaces.push(Some(Surface {
+                        // width,
+                        // height,
+                        format: Driver::IMAGE_FMT_RGB32,
+                        buffer_id,
+                        width,
+                        height,
+                        planes: vec![(stride.try_into().unwrap(), 0)]
+                        // planes: vec![(width * 3, 0)], // todo: get from gl
+                    }))
+
+
+                    // let buffer = self
+                    // let mut format = None;
+                    // // let mut usage = BufferObjectFlags::WRITE | BufferObjectFlags::SCANOUT; // uhhh idk why i can't set write, but maybe that's ok?
+                    // let mut usage = BufferObjectFlags::SCANOUT;
+
+                    // for attrib in attribs {
+                    //     match attrib.type_ {
+                    //         VASurfaceAttribType_VASurfaceAttribPixelFormat => {
+                    //             match unsafe { attrib.value.value.i } as u32 {
+                    //                 // VA_FOURCC_BGRX => format = Some(gbm::Format::Bgrx8888),
+                    //                 VA_FOURCC_BGRX => format = Some(gbm::Format::Xbgr8888), // buffer creation fails unless it's xbgr8888
+                    //                 _ => todo!(),
+                    //             }
+                    //         }
+                    //         VASurfaceAttribType_VASurfaceAttribMemoryType => {
+                    //             let v = unsafe { attrib.value.value.i };
+                    //             assert_eq!(v, VA_SURFACE_ATTRIB_MEM_TYPE_VA as i32);
+                    //         }
+                    //         _ => todo!(),
+                    //     }
+                    // }
+                    //     .gbm
+                    //     .create_buffer_object::<()>(width, height, format.unwrap(), usage)
+                    //     .unwrap();
+
+                    // let buffer_id = self.buffers.len() as u32;
+                    // self.buffers.push(Some(Buffer { buffer }));
+
+                    // self.surfaces.push(Some(Surface {
+                    //     // width,
+                    //     // height,
+                    //     format: Driver::IMAGE_FMT_RGB32,
+                    //     buffer_id,
+                    //     // planes: vec![(width * 3, 0)], // todo: get from gl
+                    // }))
+                }
                 _ => todo!(),
             }
         }
+        // todo: attribs??
+        // for s in surfaces {
+        //     *s = self.surfaces.len() as u32;
+        //     match format {
+        //         VA_RT_FORMAT_RGB32 => {
+        //             // let mut tex = 0;
+        //             // unsafe {
+        //             //     self.gles.GenTextures(1, &mut tex);
+        //             //     self.gles.BindTexture(GL_TEXTURE_2D, tex);
+        //             //     self.gles.TexImage2D(
+        //             //         GL_TEXTURE_2D,
+        //             //         0,
+        //             //         GL_RGB as i32,
+        //             //         width as i32,
+        //             //         height as i32,
+        //             //         0,
+        //             //         GL_RGB,
+        //             //         GL_UNSIGNED_BYTE,
+        //             //         null(),
+        //             //     )
+        //             // };
+
+        //             let mut configs = Vec::new();
+        //             self.egl.choose_config(
+        //                 self.egl_display,
+        //                 &[
+        //                     SURFACE_TYPE,
+        //                     PBUFFER_BIT,
+        //                     RENDERABLE_TYPE,
+        //                     OPENGL_ES2_BIT,
+        //                     COLOR_BUFFER_TYPE, RGB_BUFFER,
+        //                     RED_SIZE, 1,
+        //                     GREEN_SIZE, 1,
+        //                     BLUE_SIZE, 1,
+        //                     ALPHA_SIZE, 0,
+        //                     // EGL_YUV_NUMBER_OF_PLANES_EXT
+        //                     NONE,
+        //                 ],
+        //                 &mut configs,
+        //             ).unwrap();
+
+        //             // let surface = self.egl.create_pbuffer_surface(self.egl_display, configs[0], &[
+        //             //     WIDTH, width as _,
+        //             //     HEIGHT, height as _,
+        //             //     NONE,
+        //             // ]).unwrap();
+
+        //             // self.egl.bind_tex_image(display, surface, buffer)
+        //             self.egl.create_pixmap_surface(self.egl_display, configs[0], , attrib_list)
+        //             let image = self.egl.create_image(self.egl_display, self.egl_ctx, GL_TEXTURE_2D, tex, &[ ATTRIB_NONE ]).unwrap();
+
+        //             self.egl_export_dmabuf_image_mesa(self.egl_display.as_ptr(), )
+
+        //             let buffer_id = self.buffers.len() as u32;
+        //             self.buffers.push(Some(Buffer { gl_handle: tex, mem_size: 3 * width * height }));
+        //             self.surfaces.push(Some(Surface {
+        //                 width,
+        //                 height,
+        //                 format: Driver::IMAGE_FMT_RGB32,
+        //                 buffer_id,
+        //                 planes: vec![(width * 3, 0)], // todo: get from gl
+        //             }))
+        //         }
+        //         VA_RT_FORMAT_YUV420 => {
+        //             let mut tex = 0;
+        //             unsafe {
+        //                 self.gles.GenTextures(1, &mut tex);
+        //             };
+
+        //             let buffer_id = self.buffers.len() as u32;
+        //             self.buffers.push(Some(Buffer { gl_handle: tex, mem_size: width * height + width * (height + 1) / 2 }));
+        //             self.surfaces.push(Some(Surface {
+        //                 width,
+        //                 height,
+        //                 format: Driver::IMAGE_FMT_NV12,
+        //                 buffer_id,
+        //                 planes: vec![(width, 0), (width, width * height)], // TODO: this is incorrect! get from gl!
+        //             }))
+        //         }
+        //         _ => todo!(),
+        //     }
+        // }
+        todo!()
     }
 
     fn create_config(
@@ -515,10 +748,29 @@ impl Driver {
             .as_ref()
             .ok_or(VA_INVALID_SURFACE as VAStatus)?;
 
+        // let buffer = &self.buffer(surface.buffer_id)?.buffer;
+        let buffer = &self.buffer(surface.buffer_id)?;
+
         let mut pitches = [0; 3];
-        for (i, p) in surface.pitch.iter().enumerate() {
-            pitches[i] = *p;
+        let mut offsets = [0; 3];
+
+        for (i, (stride, offset)) in surface.planes.iter().enumerate() {
+            // pitches[i] = buffer.stride_for_plane(i as i32).unwrap();
+            // offsets[i] = buffer.offset(i as i32).unwrap();
+            pitches[i] = *stride as u32;
+            offsets[i] = *offset as u32;
+
         }
+
+        // let width = buffer.width().unwrap() as u16;
+        // let height = buffer.height().unwrap() as u16;
+        // let data_size =
+        //     buffer.width().unwrap() * buffer.width().unwrap() * surface.format.bits_per_pixel / 8; // eeeeh this is not ideal--strides!!
+        // let num_planes = buffer.plane_count().unwrap();
+        let width = surface.width.try_into().unwrap();
+        let height = surface.height.try_into().unwrap();
+        let data_size = buffer.size.try_into().unwrap();
+        let num_planes = surface.planes.len() as u32;
 
         let image_id = self.images.len() as u32;
         self.images.push(Some(Image {}));
@@ -526,13 +778,13 @@ impl Driver {
         Ok(VAImage {
             image_id,
             format: surface.format,
-            buf: surfaceid, // ??
-            width: surface.width as u16,
-            height: surface.height as u16,
-            data_size: surface.width * surface.height * surface.format.bits_per_pixel / 8,
-            num_planes: surface.pitch.len() as u32,
+            buf: surface.buffer_id,
+            width,
+            height,
+            data_size,
+            num_planes,
             pitches,
-            offsets: [0; 3],
+            offsets,
             num_palette_entries: 0,
             entry_bytes: 0,
             component_order: [0; 4],
@@ -583,17 +835,31 @@ impl Driver {
     }
 
     fn acquire_buffer_handle(&self, buf_id: u32, mem_type: u32) -> Result<VABufferInfo, i32> {
-        if mem_type == VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME {
-            
-        }
+        // if mem_type == VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME {
+        //     let buffer = self
+        //         .buffers
+        //         .get(buf_id as usize)
+        //         .ok_or(VA_STATUS_ERROR_INVALID_BUFFER as VAStatus)?
+        //         .as_ref()
+        //         .ok_or(VA_STATUS_ERROR_INVALID_BUFFER as VAStatus)?;
+
+        //     return Ok(VABufferInfo {
+        //         handle: buffer.gl_handle as usize,
+        //         type_: 0, // ???
+        //         mem_type,
+        //         mem_size, buffer.mem_size,
+        //         va_reserved: [0; _],
+        //     })
+        // }
         todo!()
-        // Ok(VABufferInfo {
-        //     handle: {},
-        //     type_: (),
-        //     mem_type: (),
-        //     mem_size: (),
-        //     va_reserved: (),
-        // })
+    }
+
+    fn buffer(&self, id: u32) -> Result<&Buffer, VAStatus> {
+        self.buffers
+            .get(id as usize)
+            .ok_or(VA_STATUS_ERROR_INVALID_BUFFER as VAStatus)?
+            .as_ref()
+            .ok_or(VA_STATUS_ERROR_INVALID_BUFFER as VAStatus)
     }
 }
 
@@ -605,6 +871,3 @@ extern "C" fn __vaDriverInit_1_13(ctx: VADriverContextP) -> VAStatus {
 
     VA_STATUS_SUCCESS as VAStatus
 }
-
-// fn __vaInit() { bidnings
-// }
