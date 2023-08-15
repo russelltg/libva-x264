@@ -13,6 +13,22 @@
             "env": { "LIBVA_DRIVERS_PATH": "${workspaceFolder}/target/debug", "LIBVA_DRIVER_NAME": "x264" },
             "cwd": "${workspaceFolder}",
             "preLaunchTask": "build"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Launch (wl-screenrec)",
+            "program": "${workspaceFolder}/../wl-screenrec/target/debug/wl-screenrec",
+            // "args": ["--display", "--drm"],
+            "env": { 
+                "LIBVA_DRIVERS_PATH": "${workspaceFolder}/target/debug", 
+                "LIBVA_DRIVER_NAME": "x264", 
+                // "WAYLAND_DISPLAY": "wayland-2" 
+            },
+            "args": ["-vvvv"],
+            "sourceLanguages": ["c", "rust"],
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "build"
         }
     ]
 }
