@@ -30,6 +30,7 @@ fn main() {
         .parse_callbacks(Box::new(bindgen::CargoCallbacks))
         .derive_default(true)
         .parse_callbacks(Box::new(DefineIntModifier))
+        .layout_tests(false)
         // Finish the builder and generate the bindings.
         .generate()
         // Unwrap the Result and panic on failure.

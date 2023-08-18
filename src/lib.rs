@@ -1,14 +1,23 @@
+#![feature(array_try_from_fn)]
+
 mod sys;
 
-use ::std::os::raw::{c_int, c_uint, c_void};
-use core::slice;
+use dcp::{convert_image, ImageFormat, PixelFormat};
+use dcv_color_primitives as dcp;
+
 use std::{
+    array,
     ffi::CStr,
+    fmt,
     fs::File,
     mem::{self, size_of, MaybeUninit},
     num::{NonZeroIsize, NonZeroUsize},
-    os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd},
+    os::{
+        fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd},
+        raw::{c_int, c_uint, c_void},
+    },
     ptr::{null, null_mut, NonNull},
+    slice,
 };
 
 use c_string::c_str;
@@ -29,6 +38,7 @@ use nix::{
     sys::mman::{mmap, munmap, MapFlags, ProtFlags},
 };
 use sys::*;
+use x264::{Colorspace, Encoder, Encoding, Preset, Setup, Tune};
 
 // const EGL_YUV_BUFFER_EXT: Int = 0x3300;
 
@@ -46,19 +56,158 @@ struct Config {
     attribs: Vec<VAConfigAttrib>,
 }
 
-#[derive(Debug)]
 enum Buffer {
     Surface {
         buf: UDmabufAllocation,
         size: usize,
-        map: Option<NonNull<c_void>>,
+        map: NonNull<u8>,
     },
     VppPipelineParameterBufferType(VAProcPipelineParameterBuffer),
     CodedBufferSegment(VACodedBufferSegment),
+    EncSequenceParameter(VAEncSequenceParameterBufferH264),
+    EncMiscParameter(VAEncMiscParameterBuffer),
+    EncSliceParameter(VAEncSliceParameterBufferH264),
+    EncPictureParameter(VAEncPictureParameterBufferH264),
     Generic {
         mem_type: u32,
         data: Vec<u8>,
     },
+}
+
+impl Buffer {
+    fn from_type_t<T>(size: u32, num_elements: u32, data: Option<&[u8]>) -> Result<T, VAStatus> {
+        if (size as usize) < num_elements as usize * size_of::<T>() {
+            return Err(VA_STATUS_ERROR_INVALID_PARAMETER);
+        }
+
+        Ok(data
+            .map(|data| unsafe { (data.as_ptr() as *mut T).read() })
+            .ok_or(VA_STATUS_ERROR_INVALID_PARAMETER)?)
+    }
+
+    fn from_type(
+        type_: u32,
+        size: u32,
+        num_elements: u32,
+        data: Option<&[u8]>,
+    ) -> Result<Buffer, VAStatus> {
+        assert_eq!(num_elements, 1); // todo!
+        Ok(match type_ {
+            VABufferType_VAProcPipelineParameterBufferType => {
+                Buffer::VppPipelineParameterBufferType(Buffer::from_type_t::<
+                    VAProcPipelineParameterBuffer,
+                >(size, num_elements, data)?)
+            }
+            VABufferType_VAEncCodedBufferType => {
+                // NOTE: this is a linked list--what's the lifetime on it???
+                Buffer::CodedBufferSegment(Buffer::from_type_t::<VACodedBufferSegment>(
+                    size,
+                    num_elements,
+                    data,
+                )?)
+            }
+            VABufferType_VAEncSequenceParameterBufferType => Buffer::EncSequenceParameter(
+                Buffer::from_type_t::<VAEncSequenceParameterBufferH264>(size, num_elements, data)?,
+            ),
+            VABufferType_VAEncMiscParameterBufferType => Buffer::EncMiscParameter(
+                Buffer::from_type_t::<VAEncMiscParameterBuffer>(size, num_elements, data)?,
+            ),
+            VABufferType_VAEncSliceParameterBufferType => Buffer::EncSliceParameter(
+                Buffer::from_type_t::<VAEncSliceParameterBufferH264>(size, num_elements, data)?,
+            ),
+            VABufferType_VAEncPictureParameterBufferType => Buffer::EncPictureParameter(
+                Buffer::from_type_t::<VAEncPictureParameterBufferH264>(size, num_elements, data)?,
+            ),
+            _ => Buffer::Generic {
+                mem_type: type_,
+                data: match data {
+                    Some(data) => data.to_owned(),
+                    None => {
+                        let mut v = Vec::new();
+                        v.resize((size * num_elements) as usize, 0);
+                        v
+                    }
+                },
+            },
+        })
+    }
+
+    fn from_surface(buf: UDmabufAllocation, size: usize) -> Buffer {
+        let map = NonNull::new(
+            unsafe {
+                mmap(
+                    None,
+                    NonZeroUsize::new(size).unwrap(),
+                    ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                    MapFlags::MAP_SHARED,
+                    buf.memfd.as_raw_fd(),
+                    0,
+                )
+            }
+            .unwrap() as *mut u8,
+        )
+        .unwrap();
+
+        Buffer::Surface { buf, size, map }
+    }
+
+    fn map(&self) -> &[u8] {
+        let (ptr, size) = match self {
+            Buffer::CodedBufferSegment(cs) => {
+                (cs as *const _ as _, mem::size_of::<VACodedBufferSegment>())
+            }
+            Buffer::Surface { size, map, .. } => (map.as_ptr() as *const _, *size),
+            _ => todo!(),
+        };
+
+        unsafe { slice::from_raw_parts(ptr as _, size) }
+    }
+    fn map_mut(&mut self) -> &mut [u8] {
+        let (ptr, size) = match self {
+            Buffer::CodedBufferSegment(cs) => {
+                (cs as *mut _ as _, mem::size_of::<VACodedBufferSegment>())
+            }
+            Buffer::Surface { size, map, .. } => (map.as_ptr(), *size),
+            _ => todo!(),
+        };
+
+        unsafe { slice::from_raw_parts_mut(ptr as _, size) }
+    }
+}
+
+impl fmt::Debug for Buffer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Surface { buf, size, map } => f
+                .debug_struct("Surface")
+                .field("buf", buf)
+                .field("size", size)
+                .field("map", map)
+                .finish(),
+            Self::VppPipelineParameterBufferType(arg0) => f
+                .debug_tuple("VppPipelineParameterBufferType")
+                .field(arg0)
+                .finish(),
+            Self::CodedBufferSegment(arg0) => {
+                f.debug_tuple("CodedBufferSegment").field(arg0).finish()
+            }
+            Self::EncSequenceParameter(arg0) => f.debug_tuple("EncSequenceParameter").finish(),
+            Self::EncMiscParameter(arg0) => f.debug_tuple("EncMiscParameter").field(arg0).finish(),
+            Self::EncSliceParameter(arg0) => f.debug_tuple("EncSliceParameter").finish(),
+            Self::EncPictureParameter(arg0) => f.debug_tuple("EncPictureParameter").finish(),
+            Self::Generic { mem_type, data } => f
+                .debug_struct("Generic")
+                .field("mem_type", mem_type)
+                .field("data", data)
+                .finish(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PlaneInfo {
+    pitch: usize,
+    offset: usize,
 }
 
 #[derive(Debug)]
@@ -67,10 +216,24 @@ struct Surface {
     height: u32,
     format: VAImageFormat,
     buffer_id: u32,
-    planes: Vec<(u32, u32)>, // (pitch, offset)
+    planes: Vec<PlaneInfo>, // (pitch, offset)
 }
 
-#[derive(Debug, Default)]
+enum ContextData {
+    Enc(Option<Encoder>),
+    Proc,
+}
+
+impl fmt::Debug for ContextData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Enc(arg0) => f.debug_tuple("Enc").finish(),
+            Self::Proc => write!(f, "Proc"),
+        }
+    }
+}
+
+#[derive(Debug)]
 struct Context {
     render_target: Option<u32>, // surface
 
@@ -78,6 +241,8 @@ struct Context {
     picture_width: i32,
     picture_height: i32,
     flag: i32,
+
+    data: ContextData,
 }
 
 #[derive(Debug)]
@@ -304,9 +469,11 @@ unsafe extern "C" fn map_buffer(
 ) -> VAStatus {
     let driver = &mut *((*ctx).pDriverData as *mut Driver);
 
-    match Driver::map_buffer(&mut driver.buffers, buf_id) {
-        Ok(ptr) => {
-            pbuf.write(ptr);
+    match driver.buffer_mut(buf_id) {
+        Ok(buf) => {
+            // NOTE: this is suuuuper sketchy and probably violates aliasing rules
+            // there's no way to enforce the aliasing rules though, unfortunately...altho I'm sure this could be improved
+            pbuf.write(buf.map_mut().as_mut_ptr() as _);
             VA_STATUS_SUCCESS
         }
         Err(e) => e,
@@ -315,11 +482,8 @@ unsafe extern "C" fn map_buffer(
 
 unsafe extern "C" fn unmap_buffer(ctx: VADriverContextP, buf_id: VABufferID) -> VAStatus {
     let driver = &mut *((*ctx).pDriverData as *mut Driver);
-
-    match driver.unmap_buffer(buf_id) {
-        Ok(_) => VA_STATUS_SUCCESS,
-        Err(e) => e,
-    }
+    // unmap is free in this implementation, it's just shared memory
+    VA_STATUS_SUCCESS
 }
 
 unsafe extern "C" fn destroy_buffer(ctx: VADriverContextP, buffer_id: VABufferID) -> VAStatus {
@@ -510,6 +674,17 @@ unsafe extern "C" fn export_surface_handle(
     }
 }
 
+unsafe extern "C" fn sync_buffer(
+    ctx: VADriverContextP,
+    buf_id: VABufferID,
+    timeout_ns: u64,
+) -> VAStatus {
+    let driver = &mut *((*ctx).pDriverData as *mut Driver);
+
+    driver.sync_buffer(buf_id, timeout_ns);
+    VA_STATUS_SUCCESS
+}
+
 unsafe extern "C" fn vpp_query_video_proc_filter_caps(
     ctx: VADriverContextP,
     context: VAContextID,
@@ -603,6 +778,7 @@ ioctl_write_ptr!(udmabuf_create, b'u', 0x42, udmabuf_create);
 
 impl Driver {
     unsafe fn init_context(ctx: &mut VADriverContext) {
+        dcp::initialize();
         // let drm_fd = BorrowedFd::borrow_raw(*(ctx.drm_state as *const c_int))
         //     .try_clone_to_owned()
         //     .unwrap(); // this seems to always be the case. not sure if this is documented at all
@@ -754,6 +930,7 @@ impl Driver {
         vtable.vaAcquireBufferHandle = Some(acquire_buffer_handle);
         vtable.vaReleaseBufferHandle = Some(release_buffer_handle);
         vtable.vaExportSurfaceHandle = Some(export_surface_handle);
+        vtable.vaSyncBuffer = Some(sync_buffer);
 
         let vtable_vpp = &mut *ctx.vtable_vpp;
         // vtable_vpp.vaQueryVideoProcFilterCaps = Some(vpp_query_video_proc_filter_caps);
@@ -824,33 +1001,29 @@ impl Driver {
         for s in surfaces {
             *s = self.surfaces.len() as u32;
             self.surfaces.push(Some(match format {
-                VA_RT_FORMAT_RGB32 => {
-                    match fourcc.unwrap() {
-                        VA_FOURCC_BGRX => {
-                            let stride = align_up(width as usize * 4, 512);
-                            let size = stride as i64 * height as i64;
+                VA_RT_FORMAT_RGB32 => match fourcc.unwrap() {
+                    VA_FOURCC_BGRX => {
+                        let stride = align_up(width as usize * 4, 512);
+                        let size = stride as i64 * height as i64;
 
-                            let buf = self.udma.alloc_dmabuf(size as usize);
+                        let buf = self.udma.alloc_dmabuf(size as usize);
 
-                            let buffer_id = self.buffers.len() as u32;
-                            self.buffers.push(Some(Buffer::Surface {
-                                // memfd,
-                                buf,
-                                size: size as usize,
-                                map: None,
-                            }));
-
-                            Surface {
-                                width,
-                                height,
-                                format: Driver::IMAGE_FMT_BGRX,
-                                buffer_id,
-                                planes: vec![(stride.try_into().unwrap(), 0)], // planes: vec![(width * 3, 0)], // todo: get from gl
-                            }
+                        let buffer_id = self.buffers.len() as u32;
+                        self.buffers
+                            .push(Some(Buffer::from_surface(buf, size as usize)));
+                        Surface {
+                            width,
+                            height,
+                            format: Driver::IMAGE_FMT_BGRX,
+                            buffer_id,
+                            planes: vec![PlaneInfo {
+                                pitch: stride,
+                                offset: 0,
+                            }],
                         }
-                        _ => todo!(),
                     }
-                }
+                    _ => todo!(),
+                },
                 VA_RT_FORMAT_YUV420 => {
                     match fourcc.unwrap() {
                         VA_FOURCC_NV12 => {
@@ -860,12 +1033,8 @@ impl Driver {
                             let buf = self.udma.alloc_dmabuf(size as usize);
 
                             let buffer_id = self.buffers.len() as u32;
-                            self.buffers.push(Some(Buffer::Surface {
-                                // memfd,
-                                buf,
-                                size: size as usize,
-                                map: None,
-                            }));
+                            self.buffers
+                                .push(Some(Buffer::from_surface(buf, size as usize)));
 
                             Surface {
                                 // width,
@@ -875,9 +1044,15 @@ impl Driver {
                                 width,
                                 height,
                                 planes: vec![
-                                    (stride.try_into().unwrap(), 0),
-                                    (stride.try_into().unwrap(), stride as u32 * height as u32),
-                                ], // planes: vec![(width * 3, 0)], // todo: get from gl
+                                    PlaneInfo {
+                                        pitch: stride,
+                                        offset: 0,
+                                    },
+                                    PlaneInfo {
+                                        pitch: stride,
+                                        offset: stride * height as usize,
+                                    },
+                                ],
                             }
                         }
                         _ => todo!(),
@@ -1016,10 +1191,10 @@ impl Driver {
         let mut pitches = [0; 3];
         let mut offsets = [0; 3];
 
-        for (i, (stride, offset)) in surface.planes.iter().enumerate() {
+        for (i, PlaneInfo { pitch, offset }) in surface.planes.iter().enumerate() {
             // pitches[i] = buffer.stride_for_plane(i as i32).unwrap();
             // offsets[i] = buffer.offset(i as i32).unwrap();
-            pitches[i] = *stride as u32;
+            pitches[i] = *pitch as u32;
             offsets[i] = *offset as u32;
         }
 
@@ -1061,12 +1236,18 @@ impl Driver {
         flag: i32,
         render_targets: &[u32],
     ) -> Result<u32, VAStatus> {
+        let config = self.config(config_id)?;
         self.contexts.push(Some(Context {
             render_target: None,
             config_id,
             picture_width,
             picture_height,
             flag,
+            data: match config.entrypoint {
+                VAEntrypoint_VAEntrypointEncPicture => ContextData::Enc(None),
+                VAEntrypoint_VAEntrypointVideoProc => ContextData::Proc,
+                _ => todo!(),
+            },
         }));
         Ok(self.contexts.len() as u32 - 1)
     }
@@ -1144,9 +1325,9 @@ impl Driver {
         let mut offset = [0; 4];
         let mut pitch = [0; 4];
 
-        for (i, (p, o)) in surf.planes.iter().enumerate() {
-            pitch[i] = *p as u32;
-            offset[i] = *o as u32;
+        for (i, plane) in surf.planes.iter().enumerate() {
+            pitch[i] = plane.pitch as u32;
+            offset[i] = plane.offset as u32;
         }
 
         *descriptor = VADRMPRIMESurfaceDescriptor {
@@ -1181,113 +1362,12 @@ impl Driver {
         Ok(())
     }
 
-    fn create_buffer(
-        &mut self,
-        context: u32,
-        type_: u32,
-        size: u32,
-        num_elements: u32,
-        data: Option<&[u8]>,
-    ) -> Result<u32, VAStatus> {
-        let id = self.buffers.len();
-
-        assert_eq!(num_elements, 1); // todo!
-        match type_ {
-            VABufferType_VAProcPipelineParameterBufferType => {
-                if (size as usize)
-                    < num_elements as usize * size_of::<VAProcPipelineParameterBuffer>()
-                {
-                    return Err(VA_STATUS_ERROR_INVALID_PARAMETER);
-                }
-                self.buffers
-                    .push(Some(Buffer::VppPipelineParameterBufferType(
-                        data.map(|data| unsafe {
-                            (data.as_ptr() as *mut VAProcPipelineParameterBuffer).read()
-                        })
-                        .unwrap_or_default(),
-                    )));
-            }
-            VABufferType_VAEncCodedBufferType => {
-                if (size as usize) < num_elements as usize * size_of::<VACodedBufferSegment>() {
-                    return Err(VA_STATUS_ERROR_INVALID_PARAMETER);
-                }
-
-                // NOTE: this is a linked list--what's the lifetime on it???
-                self.buffers.push(Some(Buffer::CodedBufferSegment(
-                    data.map(|data| unsafe { (data.as_ptr() as *mut VACodedBufferSegment).read() })
-                        .unwrap_or_default(),
-                )));
-            }
-            _ => {
-                self.buffers.push(Some(Buffer::Generic {
-                    mem_type: type_,
-                    data: match data {
-                        Some(data) => data.to_owned(),
-                        None => {
-                            let mut v = Vec::new();
-                            v.resize((size * num_elements) as usize, 0);
-                            v
-                        }
-                    },
-                }));
-            }
-        }
-
-        Ok(id as u32)
-    }
-
-    fn map_buffer(buffers: &mut Vec<Option<Buffer>>, buf_id: u32) -> Result<*mut c_void, VAStatus> {
-        let buf = Driver::get_field_mut(buffers, buf_id)?;
-
-        match buf {
-            Buffer::CodedBufferSegment(cs) => Ok(cs as *mut _ as _),
-            Buffer::Surface {
-                buf,
-                size,
-                map: Some(map),
-            } => Ok(map.as_ptr()),
-            Buffer::Surface { buf, size, map } => {
-                let ptr = unsafe {
-                    mmap(
-                        None,
-                        NonZeroUsize::new(*size).unwrap(),
-                        ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-                        MapFlags::MAP_SHARED,
-                        buf.memfd.as_raw_fd(),
-                        0,
-                    )
-                }
-                .unwrap();
-                *map = Some(NonNull::new(ptr).unwrap());
-                Ok(ptr)
-            }
-            _ => todo!(),
-        }
-    }
-
-    fn unmap_buffer(&mut self, buf_id: u32) -> Result<(), i32> {
-        match self.buffer_mut(buf_id)? {
-            Buffer::CodedBufferSegment(_) => {}
-            Buffer::Surface {
-                size,
-                map: m @ Some(_),
-                ..
-            } => {
-                unsafe { munmap(m.unwrap().as_mut(), *size) }.unwrap();
-                *m = None;
-            }
-            _ => todo!(),
-        }
-
-        Ok(())
-    }
-
     fn render_picture(
         &mut self,
         context: VAContextID,
         buffers: &[VABufferID],
     ) -> Result<(), VAStatus> {
-        let context = Driver::get_field(&self.contexts, context)?;
+        let context = Driver::get_field_mut(&mut self.contexts, context)?;
         let config = Driver::get_field(&self.configs, context.config_id)?;
 
         let target = Driver::get_field(
@@ -1301,14 +1381,10 @@ impl Driver {
             match (
                 Driver::get_field(&self.buffers, *buf)?,
                 config.profile,
-                config.entrypoint,
+                &mut context.data,
             ) {
                 (Buffer::Surface { .. }, _, _) => todo!(),
-                (
-                    Buffer::VppPipelineParameterBufferType(pic),
-                    _,
-                    VAEntrypoint_VAEntrypointVideoProc,
-                ) => {
+                (Buffer::VppPipelineParameterBufferType(pic), _, ContextData::Proc) => {
                     assert!(pic.output_region.is_null());
                     assert_eq!(pic.num_filters, 0);
                     assert!(pic.blend_state.is_null());
@@ -1320,59 +1396,157 @@ impl Driver {
                     let surface_region = unsafe { &*pic.surface_region };
                     assert_eq!(target.width, surface_region.width as u32);
                     assert_eq!(target.height, surface_region.height as u32);
+                    assert_eq!(surface_region.x, 0);
+                    assert_eq!(surface_region.y, 0);
+                    assert_eq!(input_surface.format.fourcc, VA_FOURCC_BGRX);
+                    assert_eq!(target.format.fourcc, VA_FOURCC_NV12);
 
-                    let input_map =
-                        Driver::map_buffer(&mut self.buffers, input_surface.buffer_id)? as *mut u8;
-                    let output_map =
-                        Driver::map_buffer(&mut self.buffers, target.buffer_id)? as *mut u8;
+                    println!(
+                        "proc rendering {} -> {}",
+                        input_surface.buffer_id, target.buffer_id
+                    );
 
-                    // for i in 0..surface_region.height {
-                    //     output_map.offset()
-                    // }
+                    // todo!();
+                    //     // let input_map =
+                    let ob = (&self.buffers[target.buffer_id as usize] as *const _) as usize;
+                    let [input_buffer, output_buffer] = Driver::get_field_elements(
+                        &mut self.buffers,
+                        [input_surface.buffer_id, target.buffer_id],
+                    )?;
+                    assert_eq!(ob, output_buffer as *const _ as usize);
 
-                    // self.unmap_buffer(input_surface.buffer_id);
-                    // self.unmap_buffer(target.buffer_id);
+                    let input_map = input_buffer.map();
+                    let output_map = output_buffer.map_mut();
+
+                    let plane_delimiter = target.planes[0].pitch as usize * target.height as usize;
+                    let (y, uv) = output_map.split_at_mut(plane_delimiter);
+                    convert_image(
+                        surface_region.width.into(),
+                        surface_region.height.into(),
+                        &ImageFormat {
+                            pixel_format: PixelFormat::Bgra,
+                            color_space: dcp::ColorSpace::Rgb,
+                            num_planes: 1,
+                        },
+                        Some(&[input_surface.planes[0].pitch as usize]),
+                        &[input_map],
+                        &ImageFormat {
+                            pixel_format: PixelFormat::Nv12,
+                            color_space: dcp::ColorSpace::Bt601,
+                            num_planes: 2,
+                        },
+                        Some(&[
+                            target.planes[0].pitch as usize,
+                            target.planes[1].pitch as usize,
+                        ]),
+                        &mut [y, uv],
+                    )
+                    .unwrap();
                 }
                 (Buffer::CodedBufferSegment(_), _, _) => todo!(),
                 (
-                    Buffer::Generic {
-                        mem_type: VABufferType_VAEncSequenceParameterBufferType,
-                        data,
-                    },
+                    Buffer::EncSequenceParameter(spb),
                     VAProfile_VAProfileH264Main,
-                    VAEntrypoint_VAEntrypointFEI | VAEntrypoint_VAEntrypointEncPicture,
+                    ContextData::Enc(enc),
                 ) => {
-                    println!("discarding SequenceParamter for now...")
+                    println!("encoding -> {}", target.buffer_id);
+
+                    let enc = if enc.is_none() {
+                        let render_target = Driver::get_field(
+                            &self.surfaces,
+                            context
+                                .render_target
+                                .ok_or(VA_STATUS_ERROR_INVALID_SURFACE)?,
+                        )?;
+
+                        *enc = Some(
+                            Setup::preset(Preset::Ultrafast, Tune::StillImage, false, false)
+                                .bitrate(i32::try_from(spb.bits_per_second).unwrap() / 1024)
+                                // .timebase(num, den)
+                                .build(
+                                    match render_target.format.fourcc {
+                                        VA_FOURCC_NV12 => Colorspace::NV12,
+                                        _ => todo!(),
+                                    },
+                                    render_target.width.try_into().unwrap(),
+                                    render_target.height.try_into().unwrap(),
+                                )
+                                .map_err(|_| VA_STATUS_ERROR_ENCODING_ERROR)?,
+                        );
+                        enc.as_mut().unwrap()
+                    } else {
+                        todo!()
+                    };
+
+                    // todo!()
+                }
+                (Buffer::EncSequenceParameter(spb), VAProfile_VAProfileH264Main, _) => {
+                    todo!()
                 }
                 (
-                    Buffer::Generic {
-                        mem_type: VABufferType_VAEncMiscParameterBufferType,
-                        data,
-                    },
+                    Buffer::EncMiscParameter(emp),
                     VAProfile_VAProfileH264Main,
-                    VAEntrypoint_VAEntrypointEncPicture,
+                    ContextData::Enc(_),
                 ) => {
-                    println!("discarding MiscParameter for now...")
+                    match emp.type_ {
+                        VAEncMiscParameterType_VAEncMiscParameterTypeRateControl => {
+                            let rc = unsafe {
+                                *(emp.data.as_ptr() as *const VAEncMiscParameterRateControl)
+                            };
+                            // TOOD: do something wit this
+                            println!("discarding ratecontrol for now");
+                        }
+                        VAEncMiscParameterType_VAEncMiscParameterTypeHRD => {
+                            println!("discarding hrd");
+                        }
+                        VAEncMiscParameterType_VAEncMiscParameterTypeFrameRate => {
+                            let rc = unsafe {
+                                *(emp.data.as_ptr() as *const VAEncMiscParameterFrameRate)
+                            };
+                            // TOOD: do something wit this
+                            println!("discarding framerate for now");
+                        }
+                        _ => todo!(),
+                    }
                 }
                 (
-                    Buffer::Generic {
-                        mem_type: VABufferType_VAEncPictureParameterBufferType,
-                        data,
-                    },
+                    Buffer::EncPictureParameter(eps),
                     VAProfile_VAProfileH264Main,
-                    VAEntrypoint_VAEntrypointEncPicture,
+                    ContextData::Enc(_),
                 ) => {
                     println!("discarding PictureParameter for now...")
                 }
                 (
-                    Buffer::Generic {
-                        mem_type: VABufferType_VAEncSliceParameterBufferType,
-                        data,
-                    },
+                    Buffer::EncSliceParameter(esp),
                     VAProfile_VAProfileH264Main,
-                    VAEntrypoint_VAEntrypointEncPicture,
+                    ContextData::Enc(enc),
                 ) => {
-                    println!("discarding EncSliceParameter for now...")
+                    let src_buf = Driver::get_field(&mut self.buffers, target.buffer_id)?.map();
+                    let (y, uv) = src_buf.split_at(target.planes[1].offset);
+
+                    let enc = enc.as_mut().unwrap();
+                    let data = enc
+                        .encode(
+                            0,
+                            x264::Image::new(
+                                Colorspace::NV12,
+                                target.width as i32,
+                                target.height as i32,
+                                &[
+                                    x264::Plane {
+                                        stride: target.planes[0].pitch as _,
+                                        data: y,
+                                    },
+                                    x264::Plane {
+                                        stride: target.planes[1].pitch as _,
+                                        data: uv,
+                                    },
+                                ],
+                            ),
+                        )
+                        .unwrap();
+
+                    dbg!(data.0.entirety());
                 }
 
                 a => todo!("{a:?}"),
@@ -1380,6 +1554,22 @@ impl Driver {
         }
 
         Ok(())
+    }
+
+    fn sync_buffer(&self, buf_id: VABufferID, timeout_ns: u64) {}
+
+    fn create_buffer(
+        &mut self,
+        context: u32,
+        type_: u32,
+        size: u32,
+        num_elements: u32,
+        data: Option<&[u8]>,
+    ) -> Result<u32, i32> {
+        let id = self.buffers.len();
+        self.buffers
+            .push(Some(Buffer::from_type(type_, size, num_elements, data)?));
+        Ok(id as u32)
     }
 }
 
@@ -1425,6 +1615,7 @@ impl Driver {
 
 // helpers
 impl Driver {
+    // TODO: don't just return invalid buffer for everything lmao
     fn get_field<T>(vec: &Vec<Option<T>>, id: u32) -> Result<&T, VAStatus> {
         vec.get(id as usize)
             .ok_or(VA_STATUS_ERROR_INVALID_BUFFER)?
@@ -1436,6 +1627,33 @@ impl Driver {
             .ok_or(VA_STATUS_ERROR_INVALID_BUFFER)?
             .as_mut()
             .ok_or(VA_STATUS_ERROR_INVALID_BUFFER)
+    }
+
+    fn get_field_elements<T, const N: usize>(
+        vec: &mut Vec<Option<T>>,
+        mut indicies: [u32; N],
+    ) -> Result<[&mut T; N], VAStatus> {
+        // indicies.sort();
+        assert!(indicies.windows(2).all(|w| w[0] < w[1])); // unimplemented
+
+        let mut iter = vec.iter_mut();
+
+        array::try_from_fn(|out_idx| {
+            let in_idx = indicies[out_idx];
+            let distance_from_last_index = usize::try_from(if out_idx == 0 {
+                in_idx
+            } else {
+                in_idx - indicies[out_idx - 1] - 1
+            })
+            .unwrap();
+
+            let r = iter
+                .nth(distance_from_last_index)
+                .map(|a| a.as_mut())
+                .flatten();
+            r
+        })
+        .ok_or(VA_STATUS_ERROR_INVALID_BUFFER)
     }
 
     fn buffer(&self, id: u32) -> Result<&Buffer, VAStatus> {
