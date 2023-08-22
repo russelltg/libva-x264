@@ -6,39 +6,27 @@ use dcp::{convert_image, ImageFormat, PixelFormat};
 use dcv_color_primitives as dcp;
 
 use std::{
-    array,
-    ffi::CStr,
-    fmt,
+    array, fmt,
     fs::File,
-    mem::{self, size_of, MaybeUninit},
-    num::{NonZeroIsize, NonZeroUsize},
+    mem::{self, size_of},
+    num::NonZeroUsize,
     os::{
-        fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd},
+        fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
         raw::{c_int, c_uint, c_void},
     },
-    ptr::{null, null_mut, NonNull},
+    ptr::{null_mut, NonNull},
     slice,
 };
 
 use c_string::c_str;
-// use gbm::{BufferObject, BufferObjectFlags, Device};
-// use gles30::{GlFns, GL_RGB, GL_TEXTURE_2D, GL_UNSIGNED_BYTE};
-// use khronos_egl::{
-//     Boolean, Display, Dynamic, DynamicInstance, EGLDisplay, EGLImage, Instance, Int,
-//     NativeDisplayType, Upcast, ALPHA_SIZE, ATTRIB_NONE, BLUE_SIZE, COLOR_BUFFER_TYPE,
-//     CONTEXT_CLIENT_TYPE, CONTEXT_CLIENT_VERSION, CONTEXT_MAJOR_VERSION, CONTEXT_MINOR_VERSION,
-//     CONTEXT_OPENGL_FORWARD_COMPATIBLE, DEFAULT_DISPLAY, EGL1_1, EGL1_5, GREEN_SIZE, HEIGHT, NONE,
-//     OPENGL_API, OPENGL_ES2_BIT, OPENGL_ES_API, PBUFFER_BIT, RED_SIZE, RENDERABLE_TYPE, RGB_BUFFER,
-//     SURFACE_TYPE, TRUE, WIDTH,
-// };
 use memfd::{FileSeal, Memfd, MemfdOptions};
 use nix::{
-    ioctl_read, ioctl_write_ptr,
-    libc::{ftruncate, MAP_SHARED, PROT_READ, PROT_WRITE},
-    sys::mman::{mmap, munmap, MapFlags, ProtFlags},
+    ioctl_write_ptr,
+    libc::ftruncate,
+    sys::mman::{mmap, MapFlags, ProtFlags},
 };
 use sys::*;
-use x264::{Colorspace, Encoder, Encoding, Preset, Setup, Tune};
+use x264::{Colorspace, Encoder, Preset, Setup, Tune};
 
 // const EGL_YUV_BUFFER_EXT: Int = 0x3300;
 
@@ -63,7 +51,7 @@ enum Buffer {
         map: NonNull<u8>,
     },
     VppPipelineParameterBufferType(VAProcPipelineParameterBuffer),
-    CodedBufferSegment(Vec<u8>, Vec<VACodedBufferSegment>),
+    CodedBufferSegment(Vec<u8>, VACodedBufferSegment),
     EncSequenceParameter(VAEncSequenceParameterBufferH264),
     EncMiscParameter(VAEncMiscParameterBuffer),
     EncSliceParameter(VAEncSliceParameterBufferH264),
@@ -156,7 +144,7 @@ impl Buffer {
     fn map(&self) -> &[u8] {
         let (ptr, size) = match self {
             Buffer::CodedBufferSegment(_, cs) => {
-                (cs.as_ptr() as _, mem::size_of::<VACodedBufferSegment>())
+                (cs as *const _ as _, mem::size_of::<VACodedBufferSegment>())
             }
             Buffer::Surface { size, map, .. } => (map.as_ptr() as *const _, *size),
             _ => todo!(),
@@ -167,7 +155,7 @@ impl Buffer {
     fn map_mut(&mut self) -> &mut [u8] {
         let (ptr, size) = match self {
             Buffer::CodedBufferSegment(_, cs) => {
-                (cs.as_mut_ptr() as _, mem::size_of::<VACodedBufferSegment>())
+                (cs as *mut _ as _, mem::size_of::<VACodedBufferSegment>())
             }
             Buffer::Surface { size, map, .. } => (map.as_ptr(), *size),
             _ => todo!(),
@@ -787,66 +775,6 @@ ioctl_write_ptr!(udmabuf_create, b'u', 0x42, udmabuf_create);
 impl Driver {
     unsafe fn init_context(ctx: &mut VADriverContext) {
         dcp::initialize();
-        // let drm_fd = BorrowedFd::borrow_raw(*(ctx.drm_state as *const c_int))
-        //     .try_clone_to_owned()
-        //     .unwrap(); // this seems to always be the case. not sure if this is documented at all
-        // let gbm = Device::new(drm_fd).unwrap();
-
-        // let egl = DynamicInstance::<EGL1_5>::load_required().unwrap();
-
-        // let egl_export_dmabuf_image_mesa = mem::transmute(egl.get_proc_address("eglExportDMABUFImageMESA").unwrap());
-
-        // const PLATFORM_SURFACELES_MESA: u32 = 0x31DD;
-        // let egl_display = egl
-        //     .get_platform_display(PLATFORM_SURFACELES_MESA, DEFAULT_DISPLAY, &[ATTRIB_NONE])
-        //     .unwrap();
-        // egl.initialize(egl_display).unwrap();
-        // egl.bind_api(OPENGL_ES_API).unwrap();
-
-        // // let display = egl.get_display( wayland_conn.display().).unwrap();
-        // // let display = egl.get_current_display().unwrap();
-
-        // let mut configs = Vec::new();
-        // configs.reserve(1);
-        // egl.choose_config(
-        //     egl_display,
-        //     &[
-        //         SURFACE_TYPE,
-        //         PBUFFER_BIT,
-        //         RENDERABLE_TYPE,
-        //         OPENGL_ES2_BIT,
-        //         RED_SIZE,
-        //         1,
-        //         GREEN_SIZE,
-        //         1,
-        //         BLUE_SIZE,
-        //         1,
-        //         ALPHA_SIZE,
-        //         0,
-        //         NONE,
-        //     ],
-        //     &mut configs,
-        // )
-        // .unwrap();
-
-        // let egl_ctx = egl
-        //     .create_context(
-        //         egl_display,
-        //         configs[0],
-        //         None,
-        //         &[CONTEXT_CLIENT_VERSION, 3, NONE],
-        //     )
-        //     .unwrap();
-
-        // egl.make_current(egl_display, None, None, Some(egl_ctx))
-        //     .unwrap();
-
-        // let gles = GlFns::load_with(|c_char_ptr| {
-        //     match egl.get_proc_address(CStr::from_ptr(c_char_ptr).to_str().unwrap()) {
-        //         Some(ptr) => ptr as _,
-        //         None => null_mut(),
-        //     }
-        // });
 
         ctx.pDriverData = Box::into_raw(Box::new(Driver {
             // egl,
@@ -1069,88 +997,6 @@ impl Driver {
                 _ => todo!(),
             }))
         }
-        // todo: attribs??
-        // for s in surfaces {
-        //     *s = self.surfaces.len() as u32;
-        //     match format {
-        //         VA_RT_FORMAT_RGB32 => {
-        //             // let mut tex = 0;
-        //             // unsafe {
-        //             //     self.gles.GenTextures(1, &mut tex);
-        //             //     self.gles.BindTexture(GL_TEXTURE_2D, tex);
-        //             //     self.gles.TexImage2D(
-        //             //         GL_TEXTURE_2D,
-        //             //         0,
-        //             //         GL_RGB as i32,
-        //             //         width as i32,
-        //             //         height as i32,
-        //             //         0,
-        //             //         GL_RGB,
-        //             //         GL_UNSIGNED_BYTE,
-        //             //         null(),
-        //             //     )
-        //             // };
-
-        //             let mut configs = Vec::new();
-        //             self.egl.choose_config(
-        //                 self.egl_display,
-        //                 &[
-        //                     SURFACE_TYPE,
-        //                     PBUFFER_BIT,
-        //                     RENDERABLE_TYPE,
-        //                     OPENGL_ES2_BIT,
-        //                     COLOR_BUFFER_TYPE, RGB_BUFFER,
-        //                     RED_SIZE, 1,
-        //                     GREEN_SIZE, 1,
-        //                     BLUE_SIZE, 1,
-        //                     ALPHA_SIZE, 0,
-        //                     // EGL_YUV_NUMBER_OF_PLANES_EXT
-        //                     NONE,
-        //                 ],
-        //                 &mut configs,
-        //             ).unwrap();
-
-        //             // let surface = self.egl.create_pbuffer_surface(self.egl_display, configs[0], &[
-        //             //     WIDTH, width as _,
-        //             //     HEIGHT, height as _,
-        //             //     NONE,
-        //             // ]).unwrap();
-
-        //             // self.egl.bind_tex_image(display, surface, buffer)
-        //             self.egl.create_pixmap_surface(self.egl_display, configs[0], , attrib_list)
-        //             let image = self.egl.create_image(self.egl_display, self.egl_ctx, GL_TEXTURE_2D, tex, &[ ATTRIB_NONE ]).unwrap();
-
-        //             self.egl_export_dmabuf_image_mesa(self.egl_display.as_ptr(), )
-
-        //             let buffer_id = self.buffers.len() as u32;
-        //             self.buffers.push(Some(Buffer { gl_handle: tex, mem_size: 3 * width * height }));
-        //             self.surfaces.push(Some(Surface {
-        //                 width,
-        //                 height,
-        //                 format: Driver::IMAGE_FMT_RGB32,
-        //                 buffer_id,
-        //                 planes: vec![(width * 3, 0)], // todo: get from gl
-        //             }))
-        //         }
-        //         VA_RT_FORMAT_YUV420 => {
-        //             let mut tex = 0;
-        //             unsafe {
-        //                 self.gles.GenTextures(1, &mut tex);
-        //             };
-
-        //             let buffer_id = self.buffers.len() as u32;
-        //             self.buffers.push(Some(Buffer { gl_handle: tex, mem_size: width * height + width * (height + 1) / 2 }));
-        //             self.surfaces.push(Some(Surface {
-        //                 width,
-        //                 height,
-        //                 format: Driver::IMAGE_FMT_NV12,
-        //                 buffer_id,
-        //                 planes: vec![(width, 0), (width, width * height)], // TODO: this is incorrect! get from gl!
-        //             }))
-        //         }
-        //         _ => todo!(),
-        //     }
-        // }
     }
 
     fn create_config(
@@ -1560,36 +1406,19 @@ impl Driver {
                         enc.coded_buf.ok_or(VA_STATUS_ERROR_INVALID_BUFFER)?,
                     )?;
 
-                    if let Buffer::CodedBufferSegment(raw_bytes, nals) = buffer {
+                    if let Buffer::CodedBufferSegment(raw_bytes, cbs) = buffer {
                         raw_bytes.clear();
-                        nals.clear();
-
-                        // NOTE: memory allocated up-front to ensure pointers don't change
-                        nals.reserve(data.0.len());
                         raw_bytes.extend_from_slice(data.0.entirety());
 
-                        let mut location = 0;
-                        for nal_id in 0..data.0.len() {
-                            let unit = data.0.unit(nal_id);
-                            nals.push(VACodedBufferSegment {
-                                size: u32::try_from(unit.as_ref().len()).unwrap(),
-                                bit_offset: 0,
-                                status: VA_CODED_BUF_STATUS_SINGLE_NALU,
-                                reserved: 0,
-                                buf: raw_bytes[location..].as_mut_ptr() as _,
-                                next: null_mut(),
-                                va_reserved: Default::default(),
-                            });
-
-                            // assign next ptr
-                            let len = nals.len();
-                            if len >= 2 {
-                                let next_ptr = (&mut nals[len - 2]) as *mut _ as _;
-                                nals[len - 1].next = next_ptr;
-                            }
-
-                            location += unit.as_ref().len();
-                        }
+                        *cbs = VACodedBufferSegment {
+                            size: raw_bytes.len() as u32,
+                            bit_offset: 0,
+                            status: 0,
+                            reserved: 0,
+                            buf: raw_bytes.as_mut_ptr() as _,
+                            next: null_mut(),
+                            va_reserved: Default::default(),
+                        };
                     } else {
                         return Err(VA_STATUS_ERROR_INVALID_BUFFER);
                     }
