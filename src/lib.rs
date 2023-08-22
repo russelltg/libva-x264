@@ -63,7 +63,7 @@ enum Buffer {
         map: NonNull<u8>,
     },
     VppPipelineParameterBufferType(VAProcPipelineParameterBuffer),
-    CodedBufferSegment(VACodedBufferSegment),
+    CodedBufferSegment(Vec<u8>, Vec<VACodedBufferSegment>),
     EncSequenceParameter(VAEncSequenceParameterBufferH264),
     EncMiscParameter(VAEncMiscParameterBuffer),
     EncSliceParameter(VAEncSliceParameterBufferH264),
@@ -100,11 +100,13 @@ impl Buffer {
             }
             VABufferType_VAEncCodedBufferType => {
                 // NOTE: this is a linked list--what's the lifetime on it???
-                Buffer::CodedBufferSegment(Buffer::from_type_t::<VACodedBufferSegment>(
-                    size,
-                    num_elements,
-                    data,
-                )?)
+                assert_eq!(data, None);
+                Buffer::CodedBufferSegment(Vec::with_capacity(size as usize), Default::default())
+                // Buffer::CodedBufferSegment(Buffer::from_type_t::<VACodedBufferSegment>(
+                //     size,
+                //     num_elements,
+                //     data,
+                // )?)
             }
             VABufferType_VAEncSequenceParameterBufferType => Buffer::EncSequenceParameter(
                 Buffer::from_type_t::<VAEncSequenceParameterBufferH264>(size, num_elements, data)?,
@@ -153,8 +155,8 @@ impl Buffer {
 
     fn map(&self) -> &[u8] {
         let (ptr, size) = match self {
-            Buffer::CodedBufferSegment(cs) => {
-                (cs as *const _ as _, mem::size_of::<VACodedBufferSegment>())
+            Buffer::CodedBufferSegment(_, cs) => {
+                (cs.as_ptr() as _, mem::size_of::<VACodedBufferSegment>())
             }
             Buffer::Surface { size, map, .. } => (map.as_ptr() as *const _, *size),
             _ => todo!(),
@@ -164,8 +166,8 @@ impl Buffer {
     }
     fn map_mut(&mut self) -> &mut [u8] {
         let (ptr, size) = match self {
-            Buffer::CodedBufferSegment(cs) => {
-                (cs as *mut _ as _, mem::size_of::<VACodedBufferSegment>())
+            Buffer::CodedBufferSegment(_, cs) => {
+                (cs.as_mut_ptr() as _, mem::size_of::<VACodedBufferSegment>())
             }
             Buffer::Surface { size, map, .. } => (map.as_ptr(), *size),
             _ => todo!(),
@@ -188,7 +190,7 @@ impl fmt::Debug for Buffer {
                 .debug_tuple("VppPipelineParameterBufferType")
                 .field(arg0)
                 .finish(),
-            Self::CodedBufferSegment(arg0) => {
+            Self::CodedBufferSegment(_, arg0) => {
                 f.debug_tuple("CodedBufferSegment").field(arg0).finish()
             }
             Self::EncSequenceParameter(arg0) => f.debug_tuple("EncSequenceParameter").finish(),
@@ -219,8 +221,14 @@ struct Surface {
     planes: Vec<PlaneInfo>, // (pitch, offset)
 }
 
+#[derive(Default)]
+struct EncData {
+    enc: Option<Encoder>,
+    coded_buf: Option<VABufferID>,
+}
+
 enum ContextData {
-    Enc(Option<Encoder>),
+    Enc(EncData),
     Proc,
 }
 
@@ -1244,7 +1252,7 @@ impl Driver {
             picture_height,
             flag,
             data: match config.entrypoint {
-                VAEntrypoint_VAEntrypointEncPicture => ContextData::Enc(None),
+                VAEntrypoint_VAEntrypointEncPicture => ContextData::Enc(Default::default()),
                 VAEntrypoint_VAEntrypointVideoProc => ContextData::Proc,
                 _ => todo!(),
             },
@@ -1337,7 +1345,7 @@ impl Driver {
             num_objects: 1,
             objects: [
                 _VADRMPRIMESurfaceDescriptor__bindgen_ty_1 {
-                    fd: buf.dmabuf.as_raw_fd(),
+                    fd: buf.dmabuf.try_clone().unwrap().into_raw_fd(),
                     size: *size as u32,
                     drm_format_modifier: 0, // ??
                 },
@@ -1443,7 +1451,7 @@ impl Driver {
                     )
                     .unwrap();
                 }
-                (Buffer::CodedBufferSegment(_), _, _) => todo!(),
+                (Buffer::CodedBufferSegment(_, _), _, _) => todo!(),
                 (
                     Buffer::EncSequenceParameter(spb),
                     VAProfile_VAProfileH264Main,
@@ -1451,7 +1459,7 @@ impl Driver {
                 ) => {
                     println!("encoding -> {}", target.buffer_id);
 
-                    let enc = if enc.is_none() {
+                    if enc.enc.is_none() {
                         let render_target = Driver::get_field(
                             &self.surfaces,
                             context
@@ -1459,8 +1467,8 @@ impl Driver {
                                 .ok_or(VA_STATUS_ERROR_INVALID_SURFACE)?,
                         )?;
 
-                        *enc = Some(
-                            Setup::preset(Preset::Ultrafast, Tune::StillImage, false, false)
+                        enc.enc = Some(
+                            Setup::preset(Preset::Ultrafast, Tune::StillImage, false, true)
                                 .bitrate(i32::try_from(spb.bits_per_second).unwrap() / 1024)
                                 // .timebase(num, den)
                                 .build(
@@ -1473,9 +1481,8 @@ impl Driver {
                                 )
                                 .map_err(|_| VA_STATUS_ERROR_ENCODING_ERROR)?,
                         );
-                        enc.as_mut().unwrap()
                     } else {
-                        todo!()
+                        // todo!()
                     };
 
                     // todo!()
@@ -1512,8 +1519,9 @@ impl Driver {
                 (
                     Buffer::EncPictureParameter(eps),
                     VAProfile_VAProfileH264Main,
-                    ContextData::Enc(_),
+                    ContextData::Enc(e),
                 ) => {
+                    e.coded_buf = Some(eps.coded_buf);
                     println!("discarding PictureParameter for now...")
                 }
                 (
@@ -1524,8 +1532,8 @@ impl Driver {
                     let src_buf = Driver::get_field(&mut self.buffers, target.buffer_id)?.map();
                     let (y, uv) = src_buf.split_at(target.planes[1].offset);
 
-                    let enc = enc.as_mut().unwrap();
-                    let data = enc
+                    let x264 = enc.enc.as_mut().unwrap();
+                    let data = x264
                         .encode(
                             0,
                             x264::Image::new(
@@ -1546,7 +1554,45 @@ impl Driver {
                         )
                         .unwrap();
 
-                    dbg!(data.0.entirety());
+                    // data.1.
+                    let buffer = Driver::get_field_mut(
+                        &mut self.buffers,
+                        enc.coded_buf.ok_or(VA_STATUS_ERROR_INVALID_BUFFER)?,
+                    )?;
+
+                    if let Buffer::CodedBufferSegment(raw_bytes, nals) = buffer {
+                        raw_bytes.clear();
+                        nals.clear();
+
+                        // NOTE: memory allocated up-front to ensure pointers don't change
+                        nals.reserve(data.0.len());
+                        raw_bytes.extend_from_slice(data.0.entirety());
+
+                        let mut location = 0;
+                        for nal_id in 0..data.0.len() {
+                            let unit = data.0.unit(nal_id);
+                            nals.push(VACodedBufferSegment {
+                                size: u32::try_from(unit.as_ref().len()).unwrap(),
+                                bit_offset: 0,
+                                status: VA_CODED_BUF_STATUS_SINGLE_NALU,
+                                reserved: 0,
+                                buf: raw_bytes[location..].as_mut_ptr() as _,
+                                next: null_mut(),
+                                va_reserved: Default::default(),
+                            });
+
+                            // assign next ptr
+                            let len = nals.len();
+                            if len >= 2 {
+                                let next_ptr = (&mut nals[len - 2]) as *mut _ as _;
+                                nals[len - 1].next = next_ptr;
+                            }
+
+                            location += unit.as_ref().len();
+                        }
+                    } else {
+                        return Err(VA_STATUS_ERROR_INVALID_BUFFER);
+                    }
                 }
 
                 a => todo!("{a:?}"),
